@@ -126,6 +126,11 @@ async function main() {
   try {
     await app.listen({ port: PORT, host: HOST });
     console.log(`Server started at http://${HOST}:${PORT}`);
+
+    closeWithGrace({delay: 500}, async () => {
+        console.log(`Shutting down server...`)
+    })
+
   } catch (err) {
     console.error(err);
     process.exit(1);
