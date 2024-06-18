@@ -1,141 +1,113 @@
+// Load environment variables from .env file
 import dotenv from "dotenv";
-import fastify from "fastify";
-import fastifyCors from "@fastify/cors"
-import fastifyIO from "fastify-socket.io"
-import Redis from "ioredis";
-import closeWithGrace from "close-with-grace"
-
 dotenv.config();
 
-const PORT = parseInt(process.env.PORT || "3001", 10);
+// Import dependencies
+import fastify from "fastify";
+import fastifyCors from "@fastify/cors";
+import fastifyIO from "fastify-socket.io";
+import Redis from "ioredis";
+import closeWithGrace from "close-with-grace";
+import { Socket } from "socket.io";
 
-const HOST = process.env.HOST || "0.0.0.0";
+// Set default values for environment variables
+const { PORT = "3001", HOST = "0.0.0.0", CORS_ORIGIN = "http://localhost:3000", UPSTASH_REDIS_REST_URL } = process.env;
 
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
-
-const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
-
-// the channel for the connection count
-const CONNECTION_COUNT_KEY = "chat:connection-count";
-
-const CONNECTION_COUNT_UPDATED_CHANNEL = "chat:connection-count-updated";
-
-// check if the UPSTASH_REDIS_REST_URL is set
+// Check if UPSTASH_REDIS_REST_URL is present
 if (!UPSTASH_REDIS_REST_URL) {
-  console.log("Missing UPSTASH_REDIS_REST_URL");
-  process.exit(1);
+  throw new Error("Missing UPSTASH_REDIS_REST_URL");
 }
 
-// create a publisher for the connection count channel with TLS so that it doesn't throw an error
+// Create Redis instances
 const publisher = new Redis(UPSTASH_REDIS_REST_URL, {
-    tls: {
-        rejectUnauthorized: false
-    }
+  tls: {
+    rejectUnauthorized: false,
+  },
 });
 
-// create a subscriber for the connection count channel with TLS so that it doesn't throw an error
 const subscriber = new Redis(UPSTASH_REDIS_REST_URL, {
-    tls: {
-        rejectUnauthorized: false
-    }
+  tls: {
+    rejectUnauthorized: false,
+  },
 });
 
+// Create Fastify instance
+const app = fastify();
+
+// Set up connection counter
 let connectedClients = 0;
 
-// build the server & register all the plugins
+// Function to build server
 async function buildServer() {
-  const app = fastify();
-
-  // register the cors plugin
-  await app.register(fastifyCors, {
-    origin: CORS_ORIGIN,
-  });
-
-  // register the socket.io plugin
+  // Register CORS and socket.io plugins
+  await app.register(fastifyCors, { origin: CORS_ORIGIN });
   await app.register(fastifyIO);
 
-  // get the current connection count
-  const currentCount = await publisher.get(CONNECTION_COUNT_KEY);
+  // Set initial connection count
+  await publisher.set("chat:connection-count", 0);
 
-  // set the initial connection count to 0 if it doesn't exist
-  if (!currentCount) {
-    await publisher.set(CONNECTION_COUNT_KEY, "0");
-  }
-
-  // listen to the connection event
-  app.io.on("connection", async (io) => {
+  // Event handler for new connections
+  (app as any).io.on("connection", async (io: Socket) => {
     console.log("Client connected");
 
-    // increment the connection count
-    const incResult = await publisher.incr(CONNECTION_COUNT_KEY);
+    // Increment connection count
+    const incResult = await publisher.incr("chat:connection-count");
     connectedClients++;
 
-    // publish the connection count updated event
-    await publisher.publish(CONNECTION_COUNT_UPDATED_CHANNEL, incResult.toString());
+    // Publish updated connection count
+    await publisher.publish("chat:connection-count-updated", incResult.toString());
 
-    // listen to the disconnect event
-    io.on('disconnect', async () => {
-        console.log("Client disconnected");
+    // Event handler for disconnections
+    io.on("disconnect", async () => {
+      console.log("Client disconnected");
 
-        // decrement the connection count
-        const decResult = await publisher.decr(CONNECTION_COUNT_KEY);
-        connectedClients--;
+      // Decrement connection count
+      const decResult = await publisher.decr("chat:connection-count");
+      connectedClients--;
 
-        // publish the connection count updated event
-        await publisher.publish(CONNECTION_COUNT_UPDATED_CHANNEL, decResult.toString());
-    })
+      // Publish updated connection count
+      await publisher.publish("chat:connection-count-updated", decResult.toString());
+    });
   });
 
-// subscribe to the connection count updated channel to get the current connection count
-subscriber.subscribe(CONNECTION_COUNT_UPDATED_CHANNEL, (err, count) => {
-  if (err) {
-    console.error(`Error subscribing to ${CONNECTION_COUNT_UPDATED_CHANNEL}: ${err}`); 
-    return;
-  }
-
-  console.log(`Connection count updated: ${count}`);
-})
-
-// listen to the connection count updated channel to get the current connection count
-subscriber.on("message", (channel, message) => {
-  if (channel === CONNECTION_COUNT_UPDATED_CHANNEL) {
-
-    // emit the connection count updated event to the client
-    app.io.emit(CONNECTION_COUNT_UPDATED_CHANNEL, { count: message });
-    
-    return;
-  }
-});
-
-  // healthcheck endpoint
-  app.get("/healthcheck", () => {
-    return {
-      status: "OK",
-      port: PORT,
-      host: HOST,
-    };
-  });
-
+  // Return Fastify instance
   return app;
 }
 
-// responsible for starting the server
+// Main function
 async function main() {
+  // Build server
   const app = await buildServer();
 
   try {
-    await app.listen({ port: PORT, host: HOST });
+    // Start server
+    await app.listen({ port: parseInt(PORT, 10), host: HOST });
     console.log(`Server started at http://${HOST}:${PORT}`);
 
-    closeWithGrace({delay: 500}, async () => {
-        console.log(`Shutting down server...`)
-    })
+    // Function to close server gracefully
+    closeWithGrace({ delay: 2000 }, async ({ signal, err }) => {
+      console.log("Shutting down...");
+      console.log(err, signal);
 
-  } catch (err) {
-    console.error(err);
+      // Remove disconnected clients from connection count
+      if (connectedClients > 0) {
+        console.log(`Removing ${connectedClients} clients from the count.`);
+
+        const currentCount = parseInt((await publisher.get("chat:connection-count")) || "0", 10);
+        const newCount = Math.max(currentCount - connectedClients, 0);
+
+        await publisher.set("chat:connection-count", newCount);
+      }
+
+      // Close server and Redis connections
+      await Promise.all([app.close(), subscriber.quit()]);
+    });
+  } catch (e) {
+    console.error(e);
     process.exit(1);
   }
 }
 
-// start the server
+// Start server
 main();
+
